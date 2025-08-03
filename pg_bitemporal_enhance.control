@@ -1,0 +1,7 @@
+-- pg_bitemporal_enhance.control
+-- This file defines the basic properties of the extension.
+
+comment = 'Unified Bitemporal extension with coalescing and aggregation optimizations.'
+default_version = '1.0'
+module_pathname = '$libdir/pg_bitemporal_enhance'
+relocatable = true
