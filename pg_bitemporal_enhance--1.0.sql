@@ -1,6 +1,6 @@
 -- pg_bitemporal_enhance--1.0.sql
--- This script creates the unified bitemporal extension.
--- It integrates coalescing logic and optimizes temporal aggregation.
+-- This script creates the enhanced bitemporal extension that integrates with pg_bitemporal.
+-- It adds coalescing logic and optimizes temporal aggregation while maintaining compatibility.
 
 -- First, ensure the environment is clean.
 \echo Use "CREATE EXTENSION pg_bitemporal_enhance" to load this file. \quit
@@ -8,229 +8,381 @@
 -- We need the btree_gist extension for our GiST index on temporal ranges.
 CREATE EXTENSION IF NOT EXISTS btree_gist;
 
+-- Ensure we have the required schemas
+CREATE SCHEMA IF NOT EXISTS bitemporal_internal;
+CREATE SCHEMA IF NOT EXISTS temporal_relationships;
+
 --------------------------------------------------------------------------------
--- SECTION 1: CORE TYPES AND HELPER FUNCTIONS
--- Foundational elements, likely from the original pg_bitemporal.
+-- SECTION 1: CORE HELPER FUNCTIONS
+-- Enhanced functions that work with the existing pg_bitemporal framework
 --------------------------------------------------------------------------------
 
--- Bitemporal range type for validity and transaction times.
--- We assume standard tsrange (timestamp range) is used for both.
--- Let's define a helper to get the current transaction time.
-CREATE OR REPLACE FUNCTION current_transaction_time()
-RETURNS tsrange AS $$
+-- Helper function to get current assertion time using pg_bitemporal conventions
+CREATE OR REPLACE FUNCTION bitemporal_internal.current_asserted_time()
+RETURNS temporal_relationships.timeperiod AS $$
 BEGIN
-    RETURN tsrange(transaction_timestamp(), 'infinity');
+    RETURN temporal_relationships.timeperiod(transaction_timestamp(), 'infinity');
+END;
+$$ LANGUAGE plpgsql;
+
+-- Helper function to get current effective time
+CREATE OR REPLACE FUNCTION bitemporal_internal.current_effective_time()
+RETURNS temporal_relationships.timeperiod AS $$
+BEGIN
+    RETURN temporal_relationships.timeperiod(now(), 'infinity');
 END;
 $$ LANGUAGE plpgsql;
 
 --------------------------------------------------------------------------------
 -- SECTION 2: AUTOMATIC COALESCING LOGIC
--- This section directly addresses the first problem identified in the research.
--- We create a function to merge adjacent, value-equivalent records.
+-- Enhanced coalescing that works with pg_bitemporal's effective/asserted model
 --------------------------------------------------------------------------------
 
-CREATE OR REPLACE FUNCTION bitemporal_coalesce(
-    target_table regclass,
-    pk_column TEXT,
-    pk_value TEXT,
-    value_columns TEXT[]
+CREATE OR REPLACE FUNCTION bitemporal_internal.ll_bitemporal_coalesce(
+    p_schema_name text,
+    p_table_name text,
+    p_business_key text,
+    p_business_value text,
+    p_value_columns text[]
 )
 RETURNS void AS $$
 DECLARE
-    -- Dynamic SQL queries
-    query TEXT;
-    -- Variables to hold data from rows
-    current_row RECORD;
-    previous_row RECORD;
-    new_validity tsrange;
+    v_table text;
+    v_query text;
+    v_current_row record;
+    v_previous_row record;
+    v_new_effective temporal_relationships.timeperiod;
+    v_value_condition text := '';
+    v_column text;
 BEGIN
-    -- Construct the WHERE clause for value-equivalence
-    -- e.g., "name" = 'David' AND "dept" = 'PS'
-    query := format('SELECT * FROM %s WHERE %I = %L', target_table, pk_column, pk_value);
-    EXECUTE query INTO current_row;
-
-    -- Build the condition for finding value-equivalent rows
-    -- e.g., "name" = current_row.name AND "dept" = current_row.dept
-    -- This is a simplified example; a real implementation would need to handle different data types.
-    -- For this example, we assume text-based value columns.
-    -- A more robust solution would dynamically build this part.
-    -- Let's assume for the "Employment" case: value_columns = ARRAY['Name', 'Dept']
-    -- And pk_column = 'id' (assuming an id column exists)
-
-    -- Find the immediately preceding record that is value-equivalent and its validity period meets the current one.
-    -- This is a simplified search. A full implementation would be more complex.
-    query := format(
-        'SELECT * FROM %s WHERE "Name" = %L AND "Dept" = %L AND upper(validity) = lower(%L::tsrange) AND upper(transaction_time) = ''infinity'' ORDER BY validity DESC LIMIT 1',
-        target_table,
-        current_row."Name",
-        current_row."Dept",
-        current_row.validity
+    v_table := p_schema_name || '.' || p_table_name;
+    
+    -- Get the current record
+    v_query := format('SELECT * FROM %s WHERE %I = %L AND now() <@ asserted ORDER BY effective DESC LIMIT 1', 
+                     v_table, p_business_key, p_business_value);
+    EXECUTE v_query INTO v_current_row;
+    
+    IF v_current_row IS NULL THEN
+        RAISE NOTICE 'No current record found for coalescing';
+        RETURN;
+    END IF;
+    
+    -- Build value-equivalence condition dynamically
+    FOREACH v_column IN ARRAY p_value_columns LOOP
+        IF v_value_condition != '' THEN
+            v_value_condition := v_value_condition || ' AND ';
+        END IF;
+        v_value_condition := v_value_condition || format('%I = %L', v_column, v_current_row.column_name);
+    END LOOP;
+    
+    -- Find the immediately preceding record that is value-equivalent and adjacent
+    v_query := format(
+        'SELECT * FROM %s WHERE %s AND upper(effective) = lower(%L::temporal_relationships.timeperiod) AND now() <@ asserted ORDER BY effective DESC LIMIT 1',
+        v_table,
+        v_value_condition,
+        v_current_row.effective
     );
-    EXECUTE query INTO previous_row;
-
+    EXECUTE v_query INTO v_previous_row;
+    
     -- If a preceding, adjacent, and value-equivalent record is found...
-    IF previous_row IS NOT NULL THEN
-        RAISE NOTICE 'Coalescing needed. Previous record found: %', previous_row;
-
-        -- 1. Calculate the new, combined validity period.
-        new_validity := tsrange(lower(previous_row.validity), upper(current_row.validity));
-
-        -- 2. End the transaction time of the two old records.
-        -- This marks them as historical.
-        query := format(
-            'UPDATE %s SET transaction_time = tsrange(lower(transaction_time), transaction_timestamp()) WHERE id IN (%s, %s)',
-            target_table,
-            previous_row.id,
-            current_row.id
+    IF v_previous_row IS NOT NULL THEN
+        RAISE NOTICE 'Coalescing needed. Previous record found: %', v_previous_row;
+        
+        -- 1. Calculate the new, combined effective period
+        v_new_effective := temporal_relationships.timeperiod(
+            lower(v_previous_row.effective), 
+            upper(v_current_row.effective)
         );
-        EXECUTE query;
-
-        -- 3. Insert the new, coalesced record.
-        -- This record represents the single, continuous period.
-        -- We copy all data from the most recent row and just change the validity and transaction time.
-        query := format(
-            'INSERT INTO %s ("Name", "Dept", "Title", validity, transaction_time) VALUES (%L, %L, %L, %L, current_transaction_time())',
-            target_table,
-            current_row."Name",
-            current_row."Dept",
-            current_row."Title",
-            new_validity
+        
+        -- 2. End the assertion time of the two old records
+        v_query := format(
+            'UPDATE %s SET asserted = temporal_relationships.timeperiod(lower(asserted), now()) WHERE %I IN (%s, %s)',
+            v_table,
+            p_business_key,
+            v_previous_row.column_name,
+            v_current_row.column_name
         );
-        EXECUTE query;
-
-        RAISE NOTICE 'Coalescing complete. New validity: %', new_validity;
+        EXECUTE v_query;
+        
+        -- 3. Insert the new, coalesced record
+        -- We need to dynamically build the INSERT statement based on the table structure
+        v_query := format(
+            'INSERT INTO %s SELECT %s, %L, %L FROM %s WHERE %I = %L LIMIT 1',
+            v_table,
+            bitemporal_internal.ll_bitemporal_list_of_fields(v_table),
+            v_new_effective,
+            bitemporal_internal.current_asserted_time(),
+            v_table,
+            p_business_key,
+            v_current_row.column_name
+        );
+        EXECUTE v_query;
+        
+        RAISE NOTICE 'Coalescing complete. New effective period: %', v_new_effective;
     END IF;
 END;
 $$ LANGUAGE plpgsql;
 
 --------------------------------------------------------------------------------
--- SECTION 3: BITEMPORAL OPERATIONS WITH COALESCING
--- Refines Cynthia Rusadi's work by integrating the coalescing logic.
+-- SECTION 3: ENHANCED BITEMPORAL OPERATIONS WITH COALESCING
+-- Enhanced insert function that automatically triggers coalescing
 --------------------------------------------------------------------------------
 
--- Example: An INSERT function that automatically triggers coalescing.
-CREATE OR REPLACE FUNCTION bitemporal_insert_with_coalesce(
-    target_table regclass,
-    new_data jsonb
+CREATE OR REPLACE FUNCTION bitemporal_internal.ll_bitemporal_insert_with_coalesce(
+    p_schema_name text,
+    p_table_name text,
+    p_list_of_fields text,
+    p_list_of_values text,
+    p_effective temporal_relationships.timeperiod,
+    p_asserted temporal_relationships.timeperiod,
+    p_business_key text,
+    p_business_value text,
+    p_value_columns text[]
 )
-RETURNS void AS $$
+RETURNS integer AS $$
 DECLARE
-    insert_query TEXT;
-    pk_value TEXT;
+    v_rowcount integer;
 BEGIN
-    -- 1. Perform the standard bitemporal insert.
-    -- We assume the new_data JSONB has all necessary keys.
-    -- A real function would have more robust error handling.
-    insert_query := format(
-        'INSERT INTO %s ("Name", "Dept", "Title", validity, transaction_time) VALUES (%L, %L, %L, %L::tsrange, current_transaction_time()) RETURNING id',
-        target_table,
-        new_data->>'Name',
-        new_data->>'Dept',
-        new_data->>'Title',
-        new_data->>'validity'
-    );
-    EXECUTE insert_query INTO pk_value;
-
-    -- 2. Trigger the coalescing function immediately after insert.
-    -- We pass the table, primary key name, the new row's PK value, and the columns to check for value-equivalence.
-    PERFORM bitemporal_coalesce(target_table, 'id', pk_value, ARRAY['Name', 'Dept']);
+    -- 1. Perform the standard bitemporal insert
+    SELECT bitemporal_internal.ll_bitemporal_insert(
+        p_table_name,
+        p_list_of_fields,
+        p_list_of_values,
+        p_effective,
+        p_asserted
+    ) INTO v_rowcount;
+    
+    -- 2. Trigger coalescing if insert was successful
+    IF v_rowcount > 0 THEN
+        PERFORM bitemporal_internal.ll_bitemporal_coalesce(
+            p_schema_name,
+            p_table_name,
+            p_business_key,
+            p_business_value,
+            p_value_columns
+        );
+    END IF;
+    
+    RETURN v_rowcount;
 END;
 $$ LANGUAGE plpgsql;
 
 --------------------------------------------------------------------------------
 -- SECTION 4: OPTIMIZED TEMPORAL AGGREGATION
--- Refines Aditya Bimawan's work by using indexing and pre-calculation.
--- This section directly addresses the second problem of performance.
+-- Enhanced aggregation functions that work with pg_bitemporal's timeperiod type
 --------------------------------------------------------------------------------
 
--- IMPORTANT USER ACTION:
--- For this to be efficient, a GiST index MUST be created on the validity column.
--- The user must run this command on their bitemporal table:
---
--- CREATE INDEX idx_gist_employment_validity ON employment USING GIST (validity);
---
-
--- Step 1: A function to compute the distinct time intervals ONCE.
-CREATE OR REPLACE FUNCTION compute_temporal_intervals(
-    target_table regclass,
-    OUT interval_start timestamptz,
-    OUT interval_end timestamptz
+-- Function to compute distinct temporal intervals for a bitemporal table
+CREATE OR REPLACE FUNCTION bitemporal_internal.ll_compute_temporal_intervals(
+    p_schema_name text,
+    p_table_name text,
+    OUT interval_start temporal_relationships.time_endpoint,
+    OUT interval_end temporal_relationships.time_endpoint
 )
 RETURNS SETOF record AS $$
+DECLARE
+    v_table text;
 BEGIN
-    -- This query finds all unique start and end points from the validity periods
-    -- and creates a set of distinct, non-overlapping intervals.
-    -- This is the expensive operation we want to run only once.
-    -- The GiST index on 'validity' will make this much faster.
-    RETURN QUERY
-    WITH points AS (
-        SELECT lower(validity) AS p FROM public.employment WHERE lower(validity) IS NOT NULL
-        UNION
-        SELECT upper(validity) AS p FROM public.employment WHERE upper(validity) IS NOT NULL AND upper(validity) != 'infinity'
-    ),
-    intervals AS (
-        SELECT p AS start_time, lead(p) OVER (ORDER BY p) AS end_time
-        FROM points
-    )
-    SELECT start_time, end_time
-    FROM intervals
-    WHERE end_time IS NOT NULL;
+    v_table := p_schema_name || '.' || p_table_name;
+    
+    -- This query finds all unique start and end points from the effective periods
+    -- and creates a set of distinct, non-overlapping intervals
+    RETURN QUERY EXECUTE format(
+        'WITH points AS (
+            SELECT lower(effective) AS p FROM %s WHERE lower(effective) IS NOT NULL AND now() <@ asserted
+            UNION
+            SELECT upper(effective) AS p FROM %s WHERE upper(effective) IS NOT NULL AND upper(effective) != ''infinity'' AND now() <@ asserted
+        ),
+        intervals AS (
+            SELECT p AS start_time, lead(p) OVER (ORDER BY p) AS end_time
+            FROM points
+        )
+        SELECT start_time, end_time
+        FROM intervals
+        WHERE end_time IS NOT NULL',
+        v_table, v_table
+    );
 END;
 $$ LANGUAGE plpgsql;
 
-
--- Step 2: The optimized aggregation functions that use the pre-computed intervals.
-
--- Example: Temporal COUNT
-CREATE OR REPLACE FUNCTION temporal_count(target_table regclass)
-RETURNS TABLE("count" BIGINT, "start" timestamptz, "end" timestamptz) AS $$
+-- Enhanced temporal COUNT function
+CREATE OR REPLACE FUNCTION bitemporal_internal.ll_temporal_count(
+    p_schema_name text,
+    p_table_name text
+)
+RETURNS TABLE("count" bigint, "start" temporal_relationships.time_endpoint, "end" temporal_relationships.time_endpoint) AS $$
 DECLARE
-    rec RECORD;
+    v_table text;
+    v_rec record;
 BEGIN
-    -- Create a temporary table to hold the intervals.
+    v_table := p_schema_name || '.' || p_table_name;
+    
+    -- Create a temporary table to hold the intervals
     CREATE TEMP TABLE temp_intervals ON COMMIT DROP AS
-    SELECT * FROM compute_temporal_intervals(target_table);
-
-    -- Now, for each interval, run the aggregation.
-    FOR rec IN SELECT * FROM temp_intervals LOOP
+    SELECT * FROM bitemporal_internal.ll_compute_temporal_intervals(p_schema_name, p_table_name);
+    
+    -- For each interval, run the aggregation
+    FOR v_rec IN SELECT * FROM temp_intervals LOOP
         RETURN QUERY EXECUTE format(
-            'SELECT count(*), %L::timestamptz, %L::timestamptz
+            'SELECT count(*), %L::temporal_relationships.time_endpoint, %L::temporal_relationships.time_endpoint
              FROM %s
-             WHERE validity && tsrange(%L, %L, ''[)'')', -- Check for overlap
-            rec.interval_start,
-            rec.interval_end,
-            target_table,
-            rec.interval_start,
-            rec.interval_end
+             WHERE effective && temporal_relationships.timeperiod(%L, %L, ''[)'') AND now() <@ asserted',
+            v_rec.interval_start,
+            v_rec.interval_end,
+            v_table,
+            v_rec.interval_start,
+            v_rec.interval_end
         );
     END LOOP;
 END;
 $$ LANGUAGE plpgsql;
 
--- Example: Temporal MAX on a 'salary' column (assuming it's numeric)
-CREATE OR REPLACE FUNCTION temporal_max_salary(target_table regclass)
-RETURNS TABLE("max_salary" NUMERIC, "start" timestamptz, "end" timestamptz) AS $$
+-- Enhanced temporal MAX function for any numeric column
+CREATE OR REPLACE FUNCTION bitemporal_internal.ll_temporal_max(
+    p_schema_name text,
+    p_table_name text,
+    p_column_name text
+)
+RETURNS TABLE("max_value" numeric, "start" temporal_relationships.time_endpoint, "end" temporal_relationships.time_endpoint) AS $$
 DECLARE
-    rec RECORD;
+    v_table text;
+    v_rec record;
 BEGIN
-    -- Re-use the same interval computation logic.
+    v_table := p_schema_name || '.' || p_table_name;
+    
+    -- Create a temporary table to hold the intervals
     CREATE TEMP TABLE temp_intervals ON COMMIT DROP AS
-    SELECT * FROM compute_temporal_intervals(target_table);
-
-    FOR rec IN SELECT * FROM temp_intervals LOOP
+    SELECT * FROM bitemporal_internal.ll_compute_temporal_intervals(p_schema_name, p_table_name);
+    
+    FOR v_rec IN SELECT * FROM temp_intervals LOOP
         RETURN QUERY EXECUTE format(
-            'SELECT max(salary), %L::timestamptz, %L::timestamptz
+            'SELECT max(%I), %L::temporal_relationships.time_endpoint, %L::temporal_relationships.time_endpoint
              FROM %s
-             WHERE validity && tsrange(%L, %L, ''[)'')',
-            rec.interval_start,
-            rec.interval_end,
-            target_table,
-            rec.interval_start,
-            rec.interval_end
+             WHERE effective && temporal_relationships.timeperiod(%L, %L, ''[)'') AND now() <@ asserted',
+            p_column_name,
+            v_rec.interval_start,
+            v_rec.interval_end,
+            v_table,
+            v_rec.interval_start,
+            v_rec.interval_end
         );
     END LOOP;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Enhanced temporal AVG function for any numeric column
+CREATE OR REPLACE FUNCTION bitemporal_internal.ll_temporal_avg(
+    p_schema_name text,
+    p_table_name text,
+    p_column_name text
+)
+RETURNS TABLE("avg_value" numeric, "start" temporal_relationships.time_endpoint, "end" temporal_relationships.time_endpoint) AS $$
+DECLARE
+    v_table text;
+    v_rec record;
+BEGIN
+    v_table := p_schema_name || '.' || p_table_name;
+    
+    -- Create a temporary table to hold the intervals
+    CREATE TEMP TABLE temp_intervals ON COMMIT DROP AS
+    SELECT * FROM bitemporal_internal.ll_compute_temporal_intervals(p_schema_name, p_table_name);
+    
+    FOR v_rec IN SELECT * FROM temp_intervals LOOP
+        RETURN QUERY EXECUTE format(
+            'SELECT avg(%I), %L::temporal_relationships.time_endpoint, %L::temporal_relationships.time_endpoint
+             FROM %s
+             WHERE effective && temporal_relationships.timeperiod(%L, %L, ''[)'') AND now() <@ asserted',
+            p_column_name,
+            v_rec.interval_start,
+            v_rec.interval_end,
+            v_table,
+            v_rec.interval_start,
+            v_rec.interval_end
+        );
+    END LOOP;
+END;
+$$ LANGUAGE plpgsql;
+
+--------------------------------------------------------------------------------
+-- SECTION 5: ENHANCED TRIGGER GENERATION
+-- Functions to generate enhanced triggers with coalescing support
+--------------------------------------------------------------------------------
+
+-- Function to generate enhanced insert trigger with coalescing
+CREATE OR REPLACE FUNCTION bitemporal_internal.ll_generate_enhanced_insert_trigger(
+    p_schema_name text,
+    p_table_name text,
+    p_business_key text,
+    p_value_columns text[]
+)
+RETURNS text AS $$
+DECLARE
+    v_trigger_name text;
+    v_function_name text;
+    v_trigger_code text;
+BEGIN
+    v_trigger_name := p_table_name || '_enhanced_insert_trigger';
+    v_function_name := p_table_name || '_enhanced_insert_function';
+    
+    v_trigger_code := format($trigger$
+CREATE OR REPLACE FUNCTION %s.%s()
+RETURNS trigger AS $$
+DECLARE
+    v_business_value text;
+    v_value_list text := '';
+    v_field_list text := '';
+    v_rec record;
+BEGIN
+    -- Build field list and value list dynamically
+    FOR v_rec IN SELECT column_name FROM information_schema.columns 
+                 WHERE table_schema = %L AND table_name = %L 
+                 AND column_name NOT IN ('effective', 'asserted')
+                 ORDER BY ordinal_position LOOP
+        IF v_field_list != '' THEN
+            v_field_list := v_field_list || ',';
+            v_value_list := v_value_list || ',';
+        END IF;
+        v_field_list := v_field_list || v_rec.column_name;
+        v_value_list := v_value_list || format('%%L', NEW.column_name);
+    END LOOP;
+    
+    -- Get business key value
+    v_business_value := NEW.%I;
+    
+    -- Call enhanced insert with coalescing
+    PERFORM bitemporal_internal.ll_bitemporal_insert_with_coalesce(
+        %L, %L, v_field_list, v_value_list,
+        NEW.effective, NEW.asserted,
+        %L, v_business_value, %L
+    );
+    
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER %s
+    INSTEAD OF INSERT ON %s.%s
+    FOR EACH ROW EXECUTE FUNCTION %s.%s();
+$trigger$,
+        p_schema_name, v_function_name,
+        p_schema_name, p_table_name,
+        p_business_key,
+        p_schema_name, p_table_name,
+        p_business_key, p_value_columns,
+        v_trigger_name, p_schema_name, p_table_name,
+        p_schema_name, v_function_name
+    );
+    
+    RETURN v_trigger_code;
 END;
 $$ LANGUAGE plpgsql;
 
 RAISE NOTICE 'pg_bitemporal_enhance version 1.0 loaded successfully.';
+RAISE NOTICE 'Enhanced functions available:';
+RAISE NOTICE '  - bitemporal_internal.ll_bitemporal_coalesce()';
+RAISE NOTICE '  - bitemporal_internal.ll_bitemporal_insert_with_coalesce()';
+RAISE NOTICE '  - bitemporal_internal.ll_temporal_count()';
+RAISE NOTICE '  - bitemporal_internal.ll_temporal_max()';
+RAISE NOTICE '  - bitemporal_internal.ll_temporal_avg()';
+RAISE NOTICE '  - bitemporal_internal.ll_generate_enhanced_insert_trigger()';
 
