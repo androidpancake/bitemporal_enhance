@@ -3,15 +3,19 @@
 -- It adds coalescing logic and optimizes temporal aggregation while maintaining compatibility.
 
 -- First, ensure the environment is clean.
-\echo Use "CREATE EXTENSION pg_bitemporal_enhance" to load this file. \quit
+-- \echo Use "CREATE EXTENSION pg_bitemporal_enhance" to load this file. \quit
 
 -- We need the btree_gist extension for our GiST index on temporal ranges.
 CREATE EXTENSION IF NOT EXISTS btree_gist;
+
+DROP EXTENSION IF EXISTS pg_bitemporal_enhance CASCADE;
 
 -- Ensure we have the required schemas
 CREATE SCHEMA IF NOT EXISTS bitemporal_internal;
 CREATE SCHEMA IF NOT EXISTS temporal_relationships;
 
+GRANT USAGE ON SCHEMA bitemporal_internal TO public;
+GRANT USAGE ON SCHEMA temporal_relationships TO public;
 --------------------------------------------------------------------------------
 -- SECTION 1: CORE HELPER FUNCTIONS
 -- Enhanced functions that work with the existing pg_bitemporal framework
@@ -309,6 +313,7 @@ $$ LANGUAGE plpgsql;
 --------------------------------------------------------------------------------
 
 -- Function to generate enhanced insert trigger with coalescing
+-- Replace the existing function with this fixed version
 CREATE OR REPLACE FUNCTION bitemporal_internal.ll_generate_enhanced_insert_trigger(
     p_schema_name text,
     p_table_name text,
@@ -324,9 +329,9 @@ BEGIN
     v_trigger_name := p_table_name || '_enhanced_insert_trigger';
     v_function_name := p_table_name || '_enhanced_insert_function';
     
-    v_trigger_code := format($trigger$
+    v_trigger_code := format($trig$
 CREATE OR REPLACE FUNCTION %s.%s()
-RETURNS trigger AS $$
+RETURNS trigger AS $func$
 DECLARE
     v_business_value text;
     v_value_list text := '';
@@ -358,12 +363,12 @@ BEGIN
     
     RETURN NULL;
 END;
-$$ LANGUAGE plpgsql;
+$func$ LANGUAGE plpgsql;
 
 CREATE TRIGGER %s
     INSTEAD OF INSERT ON %s.%s
     FOR EACH ROW EXECUTE FUNCTION %s.%s();
-$trigger$,
+$trig$,
         p_schema_name, v_function_name,
         p_schema_name, p_table_name,
         p_business_key,
@@ -377,12 +382,4 @@ $trigger$,
 END;
 $$ LANGUAGE plpgsql;
 
-RAISE NOTICE 'pg_bitemporal_enhance version 1.0 loaded successfully.';
-RAISE NOTICE 'Enhanced functions available:';
-RAISE NOTICE '  - bitemporal_internal.ll_bitemporal_coalesce()';
-RAISE NOTICE '  - bitemporal_internal.ll_bitemporal_insert_with_coalesce()';
-RAISE NOTICE '  - bitemporal_internal.ll_temporal_count()';
-RAISE NOTICE '  - bitemporal_internal.ll_temporal_max()';
-RAISE NOTICE '  - bitemporal_internal.ll_temporal_avg()';
-RAISE NOTICE '  - bitemporal_internal.ll_generate_enhanced_insert_trigger()';
 

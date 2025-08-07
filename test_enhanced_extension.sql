@@ -7,8 +7,13 @@ SET search_path TO bitemporal_internal, temporal_relationships, public;
 -- Test 1: Create a bitemporal table using existing pg_bitemporal function
 \echo '=== Test 1: Creating bitemporal table ==='
 SELECT bitemporal_internal.ll_create_bitemporal_table(
+	'public',
     'employment_bt',
-    'employee_id integer, name text, department text, salary numeric',
+    $$employee_id int, 
+	name text, 
+	department text, 
+	salary numeric
+	$$,
     'employee_id'
 );
 
@@ -19,7 +24,7 @@ CREATE INDEX idx_gist_employment_effective ON employment_bt USING GIST (effectiv
 -- Test 3: Insert records using standard pg_bitemporal function
 \echo '=== Test 3: Inserting records with standard pg_bitemporal ==='
 SELECT bitemporal_internal.ll_bitemporal_insert(
-    'employment_bt',
+	'public.employment_bt',
     'employee_id, name, department, salary',
     '1, ''John Doe'', ''IT'', 75000',
     temporal_relationships.timeperiod('2024-01-01', '2024-06-30'),
@@ -27,7 +32,7 @@ SELECT bitemporal_internal.ll_bitemporal_insert(
 );
 
 SELECT bitemporal_internal.ll_bitemporal_insert(
-    'employment_bt',
+    'public.employment_bt',
     'employee_id, name, department, salary',
     '1, ''John Doe'', ''IT'', 80000',
     temporal_relationships.timeperiod('2024-07-01', '2024-12-31'),
@@ -35,7 +40,7 @@ SELECT bitemporal_internal.ll_bitemporal_insert(
 );
 
 SELECT bitemporal_internal.ll_bitemporal_insert(
-    'employment_bt',
+    'public.employment_bt',
     'employee_id, name, department, salary',
     '2, ''Jane Smith'', ''HR'', 65000',
     temporal_relationships.timeperiod('2024-01-01', '2024-12-31'),
