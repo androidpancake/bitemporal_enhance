@@ -1,11 +1,19 @@
 # Makefile for pg_bitemporal_enhance extension
 # Supports building, installing, testing, and development
 
+
 # Configuration
 EXTENSION_NAME = pg_bitemporal_enhance
 EXTENSION_VERSION = 1.0
-PG_CONFIG = pg_config
 PSQL = psql
+# PostgreSQL connection options
+PSQL_OPTS = -U postgres -h localhost -p 5433
+PG_BINDIR="C:/Program Files/PostgreSQL/17/bin"
+PG_CONFIG = $(PG_BINDIR)/pg_config
+
+# Database name for install/test targets (can be overridden: make install DB_NAME=your_database)
+DB_NAME=bt_enhance
+
 
 # Directories
 BUILD_DIR = build
@@ -38,6 +46,7 @@ $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
 # Install the extension
+
 install: build
 	@echo "Installing $(EXTENSION_NAME) extension..."
 	@if [ -d "$(BUILD_DIR)" ]; then \
@@ -48,6 +57,13 @@ install: build
 		echo "Error: Build directory not found. Run 'make build' first."; \
 		exit 1; \
 	fi
+# 	@echo "Loading all SQL from pg_bitemporal/sql/_load_all.sql..."
+# 	@if [ -z "$(DB_NAME)" ]; then \
+# 		echo "Warning: DB_NAME not set. Skipping SQL load. To load, use: make install DB_NAME=your_database"; \
+# 	else \
+# 		$(PSQL) $(PSQL_OPTS) -d $(DB_NAME) -f pg_bitemporal/sql/_load_all.sql; \
+# 		echo "Loaded SQL from pg_bitemporal/sql/_load_all.sql into $(DB_NAME)"; \
+# 	fi
 
 # Uninstall the extension
 uninstall:
@@ -64,7 +80,7 @@ test: build
 		exit 1; \
 	fi
 	@echo "Running comprehensive bitemporal operations test..."
-	@$(PSQL) -d $(DB_NAME) -f $(TEST_FILE)
+	@$(PSQL) $(PSQL_OPTS) -d $(DB_NAME) -f $(TEST_FILE)
 	@echo "Test completed successfully"
 
 # Test enhanced functionality
@@ -75,7 +91,7 @@ test-enhanced: build
 		exit 1; \
 	fi
 	@echo "Running enhanced functionality test..."
-	@$(PSQL) -d $(DB_NAME) -f $(ENHANCED_TEST_FILE)
+	@$(PSQL) $(PSQL_OPTS) -d $(DB_NAME) -f $(ENHANCED_TEST_FILE)
 	@echo "Enhanced test completed successfully"
 
 # Run all tests
@@ -99,8 +115,8 @@ setup-test: create-test-db
 		echo "Error: DB_NAME not set. Use: make setup-test DB_NAME=your_database"; \
 		exit 1; \
 	fi
-	@$(PSQL) -d $(DB_NAME) -c "CREATE EXTENSION IF NOT EXISTS pg_bitemporal;"
-	@$(PSQL) -d $(DB_NAME) -c "CREATE EXTENSION IF NOT EXISTS $(EXTENSION_NAME);"
+	@$(PSQL) $(PSQL_OPTS) -d $(DB_NAME) -c "CREATE EXTENSION IF NOT EXISTS pg_bitemporal;"
+	@$(PSQL) $(PSQL_OPTS) -d $(DB_NAME) -c "CREATE EXTENSION IF NOT EXISTS $(EXTENSION_NAME);"
 	@echo "Test environment setup completed"
 
 # Clean build artifacts

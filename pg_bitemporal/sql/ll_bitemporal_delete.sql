@@ -1,4 +1,6 @@
-CREATE OR REPLACE FUNCTION bitemporal_internal.ll_bitemporal_delete(p_table text
+CREATE OR REPLACE FUNCTION bitemporal_internal.ll_bitemporal_delete(
+p_schema text
+, p_table text
 , p_search_fields TEXT  -- search fields
 , p_search_values TEXT  --  search values
 , p_asserted temporal_relationships.timeperiod -- will be asserted

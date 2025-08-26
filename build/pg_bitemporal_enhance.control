@@ -1,0 +1,5 @@
+comment = 'Unified Bitemporal extension with coalescing and aggregation optimizations.'
+default_version = '1.0'
+relocatable = false
+requires = 'btree_gist'
+superuser = true

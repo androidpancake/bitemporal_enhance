@@ -49,135 +49,166 @@ $$ LANGUAGE plpgsql;
 --------------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION bitemporal_internal.ll_bitemporal_coalesce(
-    p_schema_name text,
-    p_table_name text,
-    p_business_key text,
+    p_schema_name    text,
+    p_table_name     text,
+    p_business_key   text,
     p_business_value text,
-    p_value_columns text[]
+    p_value_columns  text[]
 )
 RETURNS void AS $$
 DECLARE
-    v_table text; -- variable
-    v_query text;
-    v_current_row record;
-    v_previous_row record;
+    v_table            text;
+    v_query            text;
+
+    -- batas rantai yang akan digabung
+    v_chain_lower      temporal_relationships.time_endpoint;
+    v_chain_upper      temporal_relationships.time_endpoint;
+
+    -- row saat ini & sebelumnya
+    v_current_row      record;
+    v_previous_row     record;
+
+    -- nilai-nilai kolom untuk syarat kesetaraan
     v_current_row_json json;
-    v_new_effective temporal_relationships.timeperiod;
-    v_value_condition text := '';
-    v_column text;
-    v_value text;
-    v_insert_cols text;
-    v_insert_vals text;
-    v_now := now();
+    v_value_condition  text := '';
+    v_column           text;
+    v_value            text;
+
+    -- daftar effective yang harus ditutup (literal), dipisah koma
+    v_effectives_to_close text := '';
+
+    -- hasil gabungan
+    v_new_effective    temporal_relationships.timeperiod;
+
+    -- untuk INSERT
+    v_insert_cols      text;
+    v_insert_vals      text;
 BEGIN
-    v_table := format('%I.%I', p_schema_name, p_table_name); -- 'schema.table' format
-    
-    -- 1. Get the current record (record terbaru yang masih berlaku)
+    v_table := format('%I.%I', p_schema_name, p_table_name);
+
+    ----------------------------------------------------------------
+    -- (1) Ambil current row (paling baru, masih asserted sekarang)
+    ----------------------------------------------------------------
     v_query := format(
-        'SELECT * FROM %s WHERE %I = %L AND now() <@ asserted ORDER BY lower(effective) DESC LIMIT 1', 
+        'SELECT * FROM %s
+          WHERE %I = %L
+            AND now() <@ asserted
+         ORDER BY lower(effective) DESC
+         LIMIT 1',
         v_table, p_business_key, p_business_value
     );
     EXECUTE v_query INTO v_current_row;
-    
+
     IF v_current_row IS NULL THEN
-        RAISE NOTICE 'No current record found for coalescing for % = %', p_business_key, p_business_value;
+        RAISE NOTICE 'No current record found for coalescing for % = %',
+            p_business_key, p_business_value;
         RETURN;
     END IF;
 
     v_current_row_json := row_to_json(v_current_row);
 
-    
-    -- 2. Build value-equivalence condition dynamically
-    --    Membangun klausa WHERE untuk mencari record dengan nilai yang sama persis
-    FOREACH v_column IN ARRAY p_value_columns LOOP
-        -- EXECUTE format('SELECT ($1).%I::text', v_column) INTO v_value USING v_current_row;
+    -- Inisialisasi rantai dengan current row
+    v_chain_lower := lower(v_current_row.effective);
+    v_chain_upper := upper(v_current_row.effective);
+    v_effectives_to_close := format('%L::temporal_relationships.timeperiod',
+                                    v_current_row.effective);
 
-        v_value := v_current_row_json ->> v_column;
-        
-        IF v_value_condition != '' THEN
+    ----------------------------------------------------------------
+    -- (2) Build value-equivalence (null-safe, sekali per kolom)
+    ----------------------------------------------------------------
+    v_value_condition := '';
+    FOREACH v_column IN ARRAY p_value_columns LOOP
+        v_value := v_current_row_json ->> v_column; -- text or NULL
+        IF v_value_condition <> '' THEN
             v_value_condition := v_value_condition || ' AND ';
         END IF;
-
-        v_value_condition := v_value_condition || format('%I IS NOT DISTINCT FROM %L', v_column, v_value);
-
-        -- IF v_value IS NULL THEN
-        --     v_value_condition := v_value_condition || format('%I IS NULL', v_column);
-        -- ELSE
-        --     v_value_condition := v_value_condition || format('%I = %L', v_column, v_value);
-        -- END IF;
+        -- bandingkan sebagai text, null-safe
+        v_value_condition := v_value_condition
+          || format('(%I)::text IS NOT DISTINCT FROM %L', v_column, v_value);
     END LOOP;
-    
-    -- 3. Find the immediately preceding record that is value-equivalent and adjacent
-    --    Cari record sebelumnya yang nilainya sama DAN periode waktunya bersentuhan langsung
-    v_query := format(
-        'SELECT * FROM %s WHERE %I = %L AND %s AND upper(effective) = lower(%L::temporal_relationships.timeperiod) AND now() <@ asserted ORDER BY effective DESC LIMIT 1',
-        v_table,
-        p_business_key,
-        p_business_value,
-        v_value_condition,
-        v_current_row.effective
-    );
-    EXECUTE v_query INTO v_previous_row;
-    
-    -- 4. Jika record yang cocok ditemukan, lakukan penggabungan (coalesce)
-    IF v_previous_row IS NOT NULL THEN
-        
-        -- 4.1. Hitung periode `effective` yang baru
-        v_new_effective := temporal_relationships.timeperiod(
-            lower(v_previous_row.effective), 
-            upper(v_current_row.effective)
-        );
-        
-        -- 4.2. Akhiri masa berlaku DUA record lama
-        v_query := format(
-            'UPDATE %s SET asserted = 
-                CASE 
-                    WHEN asserted IS NULL 
-                        THEN temporal_relationships.timeperiod(now(), now()) 
-                    ELSE 
-                        temporal_relationships.timeperiod(lower(asserted), now())
-                END
-            WHERE %I = %L AND effective IN (%L, %L)',
-            v_table,
-            p_business_key,
-            p_business_value,
-            v_previous_row.effective,
-            v_current_row.effective
-        );
 
-        EXECUTE v_query;
-        
-        -- 4.3. Bangun dan jalankan query INSERT untuk record baru yang sudah digabung
-        
-        -- Bangun daftar kolom untuk INSERT, dengan mengutip setiap kolom secara aman
-        v_insert_cols := format('%I', p_business_key);
-        FOREACH v_column IN ARRAY p_value_columns LOOP
-            v_insert_cols := v_insert_cols || ', ' || format('%I', v_column);
-        END LOOP;
-        v_insert_cols := v_insert_cols || ', effective, asserted';
-        
-        -- Bangun daftar nilai untuk VALUES, mengambil data dari v_current_row
-        v_insert_vals := format('%L', p_business_value); -- Mulai dengan business key value
-        FOREACH v_column IN ARRAY p_value_columns LOOP
-            v_value := v_current_row_json ->> v_column;
-            v_insert_vals := v_insert_vals || ', ' || format('%L', v_value);
-        END LOOP;
-        
-        -- Tambahkan periode effective dan asserted yang baru
-        v_insert_vals := v_insert_vals || format(', %L::temporal_relationships.timeperiod, %L::temporal_relationships.timeperiod', v_new_effective, bitemporal_internal.current_asserted_time());
-        
-        -- Gabungkan semuanya menjadi satu query INSERT yang valid
-        v_query := format('INSERT INTO %s (%s) VALUES (%s)', v_table, v_insert_cols, v_insert_vals);
-        
-        RAISE NOTICE 'Executing Coalesce INSERT: %', v_query; -- Untuk debugging
-        EXECUTE v_query;
-        
-        RAISE NOTICE 'Coalesced records for % = %', p_business_key, p_business_value;
-    ELSE
-        RAISE NOTICE 'No adjacent, value-equivalent record found to coalesce for % = %', p_business_key, p_business_value;
+    ----------------------------------------------------------------
+    -- (3) LOOP: mundur terus cari previous yang adjacent & equal
+    ----------------------------------------------------------------
+    LOOP
+        v_query := format(
+            'SELECT * FROM %s
+               WHERE %I = %L
+                 AND %s
+                 AND upper(effective) = %L
+             ORDER BY lower(effective) DESC
+             LIMIT 1',
+            v_table,
+            p_business_key, p_business_value,
+            v_value_condition,
+            v_chain_lower  -- cari yang menempel tepat di kiri
+        );
+        EXECUTE v_query INTO v_previous_row;
+
+        EXIT WHEN v_previous_row IS NULL;
+
+        -- extend rantai ke kiri
+        v_chain_lower := lower(v_previous_row.effective);
+        v_effectives_to_close := v_effectives_to_close || ', '
+          || format('%L::temporal_relationships.timeperiod',
+                    v_previous_row.effective);
+    END LOOP;
+
+    -- Jika tidak ada previous yang match, tidak ada coalesce dilakukan
+    IF v_chain_lower = lower(v_current_row.effective) THEN
+        RAISE NOTICE 'No adjacent, value-equivalent record found to coalesce for % = %',
+            p_business_key, p_business_value;
+        RETURN;
     END IF;
+
+    ----------------------------------------------------------------
+    -- (4) Tutup semua segmen lama dalam rantai
+    ----------------------------------------------------------------
+    v_query := format(
+        'UPDATE %s
+            SET asserted = temporal_relationships.timeperiod(lower(asserted), now())
+          WHERE %I = %L
+            AND effective IN (%s)',
+        v_table,
+        p_business_key, p_business_value,
+        v_effectives_to_close
+    );
+    EXECUTE v_query;
+
+    ----------------------------------------------------------------
+    -- (5) INSERT satu record hasil gabungan dari v_chain_lower..v_chain_upper
+    ----------------------------------------------------------------
+    v_new_effective := temporal_relationships.timeperiod(v_chain_lower, v_chain_upper);
+
+    -- kolom-kolom
+    v_insert_cols := format('%I', p_business_key);
+    FOREACH v_column IN ARRAY p_value_columns LOOP
+        v_insert_cols := v_insert_cols || ', ' || format('%I', v_column);
+    END LOOP;
+    v_insert_cols := v_insert_cols || ', effective, asserted';
+
+    -- nilainya mengikuti current row (karena value-equivalent sepanjang rantai)
+    v_insert_vals := format('%L', p_business_value);
+    FOREACH v_column IN ARRAY p_value_columns LOOP
+        v_value := v_current_row_json ->> v_column;
+        v_insert_vals := v_insert_vals || ', ' || format('%L', v_value);
+    END LOOP;
+
+    v_insert_vals := v_insert_vals
+        || format(', %L::temporal_relationships.timeperiod, %L::temporal_relationships.timeperiod',
+                  v_new_effective, bitemporal_internal.current_asserted_time());
+
+    v_query := format('INSERT INTO %s (%s) VALUES (%s)',
+                      v_table, v_insert_cols, v_insert_vals);
+    EXECUTE v_query;
+
+    RAISE NOTICE 'Coalesced chain for % = % into [% - %]',
+                 p_business_key, p_business_value, v_chain_lower, v_chain_upper;
+
 END;
 $$ LANGUAGE plpgsql;
+
+
 
 --------------------------------------------------------------------------------
 -- SECTION 3: ENHANCED BITEMPORAL OPERATIONS WITH COALESCING
@@ -198,11 +229,10 @@ CREATE OR REPLACE FUNCTION bitemporal_internal.ll_bitemporal_insert_with_coalesc
 RETURNS integer AS $$
 DECLARE
     v_rowcount integer;
-    v_table text := p_schema_name || '.' || p_table_name;
 BEGIN
     -- 1. Perform the standard bitemporal insert
     SELECT bitemporal_internal.ll_bitemporal_insert(
-        v_table,
+        p_table_name,
         p_list_of_fields,
         p_list_of_values,
         p_effective,
@@ -218,93 +248,10 @@ BEGIN
             p_business_value,
             p_value_columns
         );
+    ELSE
+        RAISE NOTICE 'No rows inserted for % in %', p_business_value, p_table_name;
     END IF;
     
-    RETURN v_rowcount;
-END;
-$$ LANGUAGE plpgsql;
-
-DROP FUNCTION IF EXISTS bitemporal_internal.ll_bitemporal_insert_reference;
-
-CREATE OR REPLACE FUNCTION bitemporal_internal.ll_bitemporal_insert_reference(
-    p_schema_name text,
-    p_table_name text,
-    p_list_of_fields text,
-    p_list_of_values text,
-    p_effective temporal_relationships.timeperiod,
-    p_asserted temporal_relationships.timeperiod,
-    p_business_key text,
-    p_business_value text,
-    p_value_columns text[],
-    p_ref_table text,
-    p_ref_key_field text,
-    p_ref_key_value text,
-    p_ref_effective_column text
-) RETURNS integer
-AS $$
-DECLARE
-    v_rowcount integer;
-    v_table text := p_schema_name || '.' || p_table_name;
-    v_ref_table text := p_schema_name || '.' || p_ref_table;
-BEGIN
-    -- Validasi: pastikan nilai referensi ditemukan dan effective (validity) berada dalam effective dari tabel referensi
-    EXECUTE format(
-        $f$
-        SELECT 1
-        FROM %s
-        WHERE %I = %L
-          AND now() <@ asserted
-          AND %I @> %L::temporal_relationships.timeperiod
-        LIMIT 1
-        $f$,
-        v_ref_table,                         -- schema & table
-        p_ref_key_field,                     -- reference key field
-        p_ref_key_value,                     -- reference key value
-        p_ref_effective_column,              -- effective column in ref table
-        p_effective::text                    -- cast to text then back in SQL
-    )
-    INTO v_rowcount;
-
-    IF v_rowcount IS NULL THEN
-        RAISE EXCEPTION 'Mentor ID % not valid or validity % not in employment.', p_ref_key_value, p_effective;
-    END IF;
-
-    -- Insert ke tabel utama
-    SELECT bitemporal_internal.ll_bitemporal_insert(
-        v_table,
-        p_list_of_fields,
-        p_list_of_values,
-        p_effective,
-        p_asserted
-    ) INTO v_rowcount;
-
-    -- -- Coalesce jika insert berhasil
-    IF v_rowcount > 0 THEN
-        PERFORM bitemporal_internal.ll_bitemporal_coalesce(
-            p_schema_name,
-            p_table_name,
-            p_business_key,
-            p_business_value,
-            p_value_columns
-        );
-    END IF;
-
-    -- SELECT bitemporal_internal.ll_bitemporal_insert_with_coalesce(
-    --     p_schema_name,
-    --     p_table_name,
-    --     p_list_of_fields,
-    --     p_list_of_values,
-    --     p_effective,
-    --     p_asserted,
-    --     p_business_key,
-    --     p_business_value,
-    --     p_value_columns
-    -- ) INTO v_rowcount;
-
-    IF v_rowcount < 0 THEN
-        RAISE EXCEPTION 'Insert failed for % with values %', v_table, p_list_of_values;
-    END IF;
-
     RETURN v_rowcount;
 END;
 $$ LANGUAGE plpgsql;
